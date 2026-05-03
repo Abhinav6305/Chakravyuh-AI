@@ -1,306 +1,198 @@
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-import re
-import sqlite3
-from typing import Dict, List
-
-import bcrypt
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-import jwt
+from sqlalchemy.orm import Session
+from typing import List
+import os
+import shutil
+import pandas as pd
 
-try:
-    from .ai_report import generate_ai_report
-    from .data_loader import load_transactions, get_ip_to_accounts
-    from .graph_builder import build_transaction_graph, get_fraud_nodes
-    from .risk_engine import compute_risk_scores, get_account_risk, get_all_nodes, get_all_edges
-    from .schemas import (
-        AccountDetail,
-        AIReport,
-        AuthResponse,
-        DashboardSummary,
-        Edge,
-        LoginRequest,
-        Node,
-        SignupRequest,
-    )
-except ImportError:
-    from ai_report import generate_ai_report
-    from data_loader import load_transactions, get_ip_to_accounts
-    from graph_builder import build_transaction_graph, get_fraud_nodes
-    from risk_engine import compute_risk_scores, get_account_risk, get_all_nodes, get_all_edges
-    from schemas import (
-        AccountDetail,
-        AIReport,
-        AuthResponse,
-        DashboardSummary,
-        Edge,
-        LoginRequest,
-        Node,
-        SignupRequest,
-    )
+from database import init_db, get_db, engine, Base, Bank
+from auth import (
+    get_password_hash,
+    verify_password,
+    create_access_token,
+    get_current_bank
+)
+from schemas import (
+    SignupRequest,
+    LoginRequest,
+    AuthResponse,
+    Node,
+    Edge,
+    AccountDetail,
+    DashboardSummary
+)
+from data_loader import load_transactions, get_ip_to_accounts
+from graph_builder import build_transaction_graph, get_fraud_nodes
+from risk_engine import compute_risk_scores, get_account_risk, get_all_nodes, get_all_edges
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DB_PATH = BASE_DIR / "chakravyuh.db"
-JWT_SECRET = "change-this-for-production-demo-secret"
-JWT_ALGORITHM = "HS256"
-TOKEN_MINUTES = 60 * 12
+# Initialize database
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Chakravyuh AI Fraud Detection API")
-security = HTTPBearer()
 
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],  # Adjust for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-graphs: Dict[str, Dict] = {}
+# Global variables for in-memory graph cache per bank
+banks_graphs = {}
 
+def process_bank_data(bank_id: str):
+    """Load data and compute risk scores for a specific bank."""
+    data_path = f"data/{bank_id}_transactions.csv"
+    if not os.path.exists(data_path):
+        return None
+    
+    try:
+        # Load data
+        df = load_transactions(data_path)
+        # Build graph
+        ip_accounts = get_ip_to_accounts(df)
+        G = build_transaction_graph(df, ip_accounts)
+        # Get fraud nodes
+        fraud_nodes = get_fraud_nodes(df)
+        # Compute risk scores
+        risk_info = compute_risk_scores(G, fraud_nodes)
+        
+        banks_graphs[bank_id] = {
+            "G": G,
+            "risk_info": risk_info,
+            "df": df
+        }
+        return banks_graphs[bank_id]
+    except Exception as e:
+        print(f"Error processing data for {bank_id}: {e}")
+        return None
 
 @app.on_event("startup")
 async def startup_event():
-    DATA_DIR.mkdir(exist_ok=True)
-    init_db()
-    ensure_demo_bank()
-    warm_existing_bank_graphs()
+    os.makedirs("data", exist_ok=True)
+    # Check if sample exists, copy it for a demo bank if needed
+    if not os.path.exists("data/DEMO_transactions.csv") and os.path.exists("data/sample_transactions.csv"):
+        shutil.copy("data/sample_transactions.csv", "data/DEMO_transactions.csv")
+    process_bank_data("DEMO")
 
-
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS banks (
-                bank_id TEXT PRIMARY KEY,
-                bank_name TEXT NOT NULL,
-                branch TEXT NOT NULL,
-                password_hash BLOB NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-
-def ensure_demo_bank():
-    demo_file = DATA_DIR / "DEMO_transactions.csv"
-    if not demo_file.exists():
-        sample_file = DATA_DIR / "sample_transactions.csv"
-        if sample_file.exists():
-            demo_file.write_bytes(sample_file.read_bytes())
-
-    if get_bank("DEMO"):
-        return
-    create_bank("DEMO", "Demo Bank", "Main Branch", "demo123")
-
-
-def warm_existing_bank_graphs():
-    for csv_file in DATA_DIR.glob("*_transactions.csv"):
-        bank_id = csv_file.name.removesuffix("_transactions.csv")
-        try:
-            load_bank_graph(bank_id)
-        except Exception:
-            continue
-
-
-def normalize_bank_id(bank_id: str) -> str:
-    value = re.sub(r"[^A-Za-z0-9_-]", "", bank_id.strip().upper())
-    if not value:
-        raise HTTPException(status_code=400, detail="Bank ID is required")
-    return value
-
-
-def bank_csv_path(bank_id: str) -> Path:
-    return DATA_DIR / f"{normalize_bank_id(bank_id)}_transactions.csv"
-
-
-def hash_password(password: str) -> bytes:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
-
-
-def verify_password(password: str, password_hash: bytes) -> bool:
-    return bcrypt.checkpw(password.encode("utf-8"), password_hash)
-
-
-def get_bank(bank_id: str):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM banks WHERE bank_id = ?",
-            (normalize_bank_id(bank_id),),
-        ).fetchone()
-        return dict(row) if row else None
-
-
-def create_bank(bank_id: str, bank_name: str, branch: str, password: str):
-    bank_id = normalize_bank_id(bank_id)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO banks (bank_id, bank_name, branch, password_hash, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                bank_id,
-                bank_name.strip(),
-                branch.strip(),
-                hash_password(password),
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-
-
-def create_token(bank_id: str) -> str:
-    expires = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_MINUTES)
-    return jwt.encode({"sub": bank_id, "exp": expires}, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-
-def current_bank(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        bank_id = payload.get("sub")
-    except jwt.PyJWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-        )
-    bank = get_bank(bank_id)
-    if not bank:
-        raise HTTPException(status_code=401, detail="Bank account no longer exists")
-    return bank
-
-
-def load_bank_graph(bank_id: str):
-    csv_path = bank_csv_path(bank_id)
-    if not csv_path.exists():
-        graphs[normalize_bank_id(bank_id)] = {"df": None, "G": None, "fraud_nodes": [], "risk_info": {}}
-        return graphs[normalize_bank_id(bank_id)]
-
-    df = load_transactions(str(csv_path))
-    ip_accounts = get_ip_to_accounts(df)
-    graph = build_transaction_graph(df, ip_accounts)
-    fraud_nodes = get_fraud_nodes(df)
-    risk_info = compute_risk_scores(graph, fraud_nodes)
-    graphs[normalize_bank_id(bank_id)] = {
-        "df": df,
-        "G": graph,
-        "fraud_nodes": fraud_nodes,
-        "risk_info": risk_info,
-    }
-    return graphs[normalize_bank_id(bank_id)]
-
-
-def get_graph_state(bank_id: str):
-    bank_id = normalize_bank_id(bank_id)
-    if bank_id not in graphs:
-        return load_bank_graph(bank_id)
-    return graphs[bank_id]
-
-
-def auth_payload(bank) -> AuthResponse:
-    return AuthResponse(
-        access_token=create_token(bank["bank_id"]),
-        bank_id=bank["bank_id"],
-        bank_name=bank["bank_name"],
-        branch=bank["branch"],
-    )
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "Chakravyuh AI"}
-
-
+# Auth Endpoints
 @app.post("/signup", response_model=AuthResponse)
-async def signup(payload: SignupRequest):
-    bank_id = normalize_bank_id(payload.bank_id)
-    if get_bank(bank_id):
-        raise HTTPException(status_code=409, detail="Bank ID already exists. Please log in.")
-    if not payload.bank_name.strip() or not payload.branch.strip() or len(payload.password) < 4:
-        raise HTTPException(status_code=400, detail="Bank name, branch, and a 4+ character password are required")
-    create_bank(bank_id, payload.bank_name, payload.branch, payload.password)
-    load_bank_graph(bank_id)
-    return auth_payload(get_bank(bank_id))
-
+def signup(request: SignupRequest, db: Session = Depends(get_db)):
+    db_bank = db.query(Bank).filter(Bank.bank_id == request.bank_id).first()
+    if db_bank:
+        raise HTTPException(status_code=400, detail="Bank ID already registered")
+    
+    hashed_password = get_password_hash(request.password)
+    new_bank = Bank(
+        bank_id=request.bank_id,
+        bank_name=request.bank_name,
+        branch=request.branch,
+        hashed_password=hashed_password
+    )
+    db.add(new_bank)
+    db.commit()
+    db.refresh(new_bank)
+    
+    access_token = create_access_token(data={"sub": new_bank.bank_id})
+    return AuthResponse(
+        access_token=access_token,
+        bank_id=new_bank.bank_id,
+        bank_name=new_bank.bank_name,
+        branch=new_bank.branch
+    )
 
 @app.post("/login", response_model=AuthResponse)
-async def login(payload: LoginRequest):
-    bank = get_bank(payload.bank_id)
-    if not bank or not verify_password(payload.password, bank["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid bank ID or password")
-    return auth_payload(bank)
-
-
-@app.post("/upload", response_model=DashboardSummary)
-async def upload_transactions(file: UploadFile = File(...), bank=Depends(current_bank)):
-    if not file.filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Please upload a CSV file")
-
-    csv_path = bank_csv_path(bank["bank_id"])
-    contents = await file.read()
-    csv_path.write_bytes(contents)
-
-    try:
-        load_bank_graph(bank["bank_id"])
-    except Exception as exc:
-        csv_path.unlink(missing_ok=True)
-        load_bank_graph(bank["bank_id"])
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    return build_summary(bank)
-
-
-@app.get("/dashboard/summary", response_model=DashboardSummary)
-async def dashboard_summary(bank=Depends(current_bank)):
-    return build_summary(bank)
-
-
-def build_summary(bank) -> DashboardSummary:
-    state = get_graph_state(bank["bank_id"])
-    nodes = get_all_nodes(state["risk_info"])
-    return DashboardSummary(
-        bank_id=bank["bank_id"],
-        bank_name=bank["bank_name"],
-        total_accounts=len(nodes),
-        high_risk_count=sum(1 for node in nodes if node["risk_level"] == "High"),
-        medium_risk_count=sum(1 for node in nodes if node["risk_level"] == "Medium"),
-        low_risk_count=sum(1 for node in nodes if node["risk_level"] == "Low"),
-        total_edges=state["G"].number_of_edges() if state["G"] is not None else 0,
-        system_status="Active" if nodes else "Pending",
+def login(request: LoginRequest, db: Session = Depends(get_db)):
+    bank = db.query(Bank).filter(Bank.bank_id == request.bank_id).first()
+    if not bank or not verify_password(request.password, bank.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    access_token = create_access_token(data={"sub": bank.bank_id})
+    return AuthResponse(
+        access_token=access_token,
+        bank_id=bank.bank_id,
+        bank_name=bank.bank_name,
+        branch=bank.branch
     )
 
+# Data Endpoints
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), current_bank: Bank = Depends(get_current_bank)):
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported")
+    
+    os.makedirs("data", exist_ok=True)
+    file_path = f"data/{current_bank.bank_id}_transactions.csv"
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    # Re-process graph data
+    result = process_bank_data(current_bank.bank_id)
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to process CSV file.")
+        
+    return {"message": "Data uploaded and graph updated successfully."}
+
+# Analytics Endpoints
+@app.get("/dashboard/summary", response_model=DashboardSummary)
+def get_dashboard_summary(current_bank: Bank = Depends(get_current_bank)):
+    graph_data = banks_graphs.get(current_bank.bank_id)
+    if not graph_data:
+        return DashboardSummary(
+            bank_id=current_bank.bank_id,
+            bank_name=current_bank.bank_name,
+            total_accounts=0,
+            high_risk_count=0,
+            medium_risk_count=0,
+            low_risk_count=0,
+            total_edges=0,
+            system_status="Pending Data Upload"
+        )
+    
+    risk_info = graph_data["risk_info"]
+    G = graph_data["G"]
+    
+    high = sum(1 for info in risk_info.values() if info["risk_level"] == "High")
+    medium = sum(1 for info in risk_info.values() if info["risk_level"] == "Medium")
+    low = sum(1 for info in risk_info.values() if info["risk_level"] == "Low")
+    
+    return DashboardSummary(
+        bank_id=current_bank.bank_id,
+        bank_name=current_bank.bank_name,
+        total_accounts=len(risk_info),
+        high_risk_count=high,
+        medium_risk_count=medium,
+        low_risk_count=low,
+        total_edges=G.number_of_edges(),
+        system_status="Active"
+    )
 
 @app.get("/graph/nodes", response_model=List[Node])
-async def get_nodes(bank=Depends(current_bank)):
-    state = get_graph_state(bank["bank_id"])
-    return get_all_nodes(state["risk_info"])
-
+async def get_nodes(current_bank: Bank = Depends(get_current_bank)):
+    graph_data = banks_graphs.get(current_bank.bank_id)
+    if not graph_data:
+        return []
+    return get_all_nodes(graph_data["risk_info"])
 
 @app.get("/graph/edges", response_model=List[Edge])
-async def get_edges(bank=Depends(current_bank)):
-    state = get_graph_state(bank["bank_id"])
-    return get_all_edges(state["G"]) if state["G"] is not None else []
-
+async def get_edges(current_bank: Bank = Depends(get_current_bank)):
+    graph_data = banks_graphs.get(current_bank.bank_id)
+    if not graph_data:
+        return []
+    return get_all_edges(graph_data["G"])
 
 @app.get("/account/{account_id}", response_model=AccountDetail)
-async def get_account(account_id: str, bank=Depends(current_bank)):
-    state = get_graph_state(bank["bank_id"])
-    return get_account_risk(account_id, state["risk_info"])
-
-
-@app.get("/ai/report", response_model=AIReport)
-async def ai_report(bank=Depends(current_bank)):
-    state = get_graph_state(bank["bank_id"])
-    summary = build_summary(bank).model_dump()
-    nodes = get_all_nodes(state["risk_info"])
-    edges = get_all_edges(state["G"]) if state["G"] is not None else []
-    return generate_ai_report(bank, summary, nodes, edges)
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+async def get_account(account_id: str, current_bank: Bank = Depends(get_current_bank)):
+    graph_data = banks_graphs.get(current_bank.bank_id)
+    if not graph_data:
+        raise HTTPException(status_code=404, detail="No data available")
+    
+    info = get_account_risk(account_id, graph_data["risk_info"])
+    if not info:
+        raise HTTPException(status_code=404, detail="Account not found")
+        
+    return AccountDetail(id=account_id, **info)
