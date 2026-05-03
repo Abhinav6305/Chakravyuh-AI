@@ -1,0 +1,12 @@
+backend/.env
+backend/chakravyuh.db
+backend/__pycache__/
+backend/**/__pycache__/
+backend/data/*_transactions.csv
+!backend/data/sample_transactions.csv
+frontend/.next
+frontend/build
+frontend/node_modules
+frontend/.env*
+*.pyc
+.DS_Store

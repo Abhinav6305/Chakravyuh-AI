@@ -1,0 +1,11 @@
+{
+  "name": "chakravyuh-ai",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1",
+    "backend": "cd backend && python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload",
+    "frontend": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build"
+  }
+}
